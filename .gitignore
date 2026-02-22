@@ -143,3 +143,14 @@ poetry.toml
 # IDE
 *.code-workspace
 .windsurf/
+
+# Personal folders
+ai/
+jinja/
+pmodels/
+slots/
+
+# Personal files
+bcommands
+llama_slot_proxy.py
+nohup.out

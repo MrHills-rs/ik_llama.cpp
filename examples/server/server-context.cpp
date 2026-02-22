@@ -2810,7 +2810,10 @@ void server_context::create_checkpoint(server_slot & slot) {
     
     if (!slot.server_cached_prompt.checkpoints.empty()) {
         int32_t last_pos_max = slot.server_cached_prompt.checkpoints.back().pos_max;
-        do_checkpoint = do_checkpoint && (pos_max > last_pos_max + 64);
+        int32_t gap = params_base.n_ctx_checkpoints_gap; 
+    
+        do_checkpoint = do_checkpoint && (pos_max > last_pos_max + gap);
+    
         
         if (!do_checkpoint) {
             LLAMA_LOG_DEBUG("CHECKPOINT: Skipped (too close to last checkpoint): slot=%d, pos_max=%d, last_pos_max=%d, min_gap=64\n",
