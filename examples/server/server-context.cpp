@@ -759,6 +759,24 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         // TODO: mtmd does not support prompt cache
         update_cache = update_cache && (ret->mctx == nullptr);
 
+        // ============================================================================
+        // HYBRID MODEL: Disable prompt_cache (file-based caching)
+        // ============================================================================
+        // File-based prompt cache is NOT compatible with hybrid models because:
+        // 1. It saves token sequences, not KV cache state
+        // 2. Loading tokens doesn't restore recurrent layer state
+        // 3. Results in corrupted generation after cache load
+        //
+        // Use checkpoints instead (in-memory KV cache snapshots)
+        // ============================================================================
+        bool is_stateful_model = llama_model_is_hybrid(model) || 
+                                  llama_model_is_recurrent(model);
+    
+        if (is_stateful_model) {
+            update_cache = false;
+            LLAMA_LOG_DEBUG("HYBRID MODEL: Disabled prompt_cache (file-based): slot=%d. Reason: File cache doesn't preserve recurrent layer state. Alternative: Use --checkpoints.\n", ret->id);
+        }
+
         LLAMA_LOG_INFO("======== Prompt cache: cache size: %d, n_keep: %d, n_discarded_prompt: %d, cache_ram_n_min: %d, f_keep: %.2f, cache_ram_similarity: %.2f\n",
             (int)tokens.size(), ret->n_kept_prompt, ret->n_discarded_prompt, cache_ram_n_min, f_keep, cache_ram_similarity);
         if (update_cache) {
@@ -1678,6 +1696,9 @@ void server_context::send_partial_response(server_slot& slot, completion_token_o
 }
 
 void server_context::send_final_response(server_slot& slot) {
+    
+    create_checkpoint(slot);
+    
     auto res = std::make_unique<server_task_result_cmpl_final>();
     res->final_result = true;
     res->id = slot.id_task;
@@ -2587,62 +2608,133 @@ void server_context::add_sampled_tokens() {
     }
 }
 
+// ============================================================================
+// FUNCTION: apply_checkpoint
+// ============================================================================
+// PURPOSE:
+//   Validate and restore KV cache state when processing a new request.
+//
+// WHY THIS EXISTS (Qwen 3.5 Hybrid Architecture):
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ Qwen 3.5 uses Delta Net recurrent layers (not pure transformer).       │
+// │ Recurrent layers maintain INTERNAL STATE that cannot be truncated.     │
+// │                                                                         │
+// │ Traditional Transformer:           Hybrid (Qwen 3.5):                   │
+// │ ┌────────────────────────┐         ┌────────────────────────┐           │
+// │ │ KV Cache: [0..500]     │         │ KV Cache: [0..500]     │           │
+// │ │ Can delete [400..500] ✓│         │ Can delete [400..500] ✗│           │
+// │ │ State remains valid    │         │ State BECOMES INVALID  │           │
+// │ └────────────────────────┘         └────────────────────────┘           │
+// │                                                                         │
+// │ When user rolls back a message, we need to "undo" tokens from cache.   │
+// │ For hybrid models, this is IMPOSSIBLE without a saved checkpoint.      │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// HOW IT WORKS:
+//   1. Detect if cache state is inconsistent (n_past < cache_tokens.size())
+//   2. Query KV cache for pos_min (earliest position that can't be deleted)
+//   3. If pos_min > threshold, cache is INVALID
+//   4. Search checkpoints for a valid restore point
+//   5. If found: restore from checkpoint
+//   6. If not found: FORCE FULL REBUILD (n_past = 0, clear everything)
+//
+// CALLED FROM:
+//   batch_pending_prompt() — when processing new prompt tokens
+// ============================================================================
+
 void server_context::apply_checkpoint(server_slot & slot) {
     const auto pos_min_thold = std::max(0, slot.n_past - 1);
-    if (!mctx && slot.n_past > 0 && slot.n_past < slot.cache_tokens.n_tokens()) {
+    
+    if (!mctx && slot.n_past > 0 && slot.n_past < (int32_t)slot.cache_tokens.size()) {
+        
         int32_t pos_min = 0;
-        if (llama_model_is_hybrid(llama_get_model(slot.ctx)) || llama_model_is_recurrent(llama_get_model(slot.ctx))) {
-            pos_min = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
+        int32_t pos_max = 0;
+        
+        bool is_stateful_model = llama_model_is_hybrid(llama_get_model(slot.ctx)) || 
+                                  llama_model_is_recurrent(llama_get_model(slot.ctx));
+        
+        if (is_stateful_model) {
+            pos_min = 0;
+            pos_max = llama_kv_cache_seq_pos_max(ctx, slot.id);
+            
+            LLAMA_LOG_INFO("CHECKPOINT (hybrid model): slot=%d, pos_min=%d, pos_max=%d, n_past=%d, cache_size=%d\n",
+                slot.id, pos_min, pos_max, slot.n_past, (int)slot.cache_tokens.size());
         }
 
-        if (pos_min > pos_min_thold+2) {
-            // TODO: support can be added in the future when corresponding vision models get released
-            GGML_ASSERT(!slot.cache_tokens.has_mtmd);
+        int32_t threshold_gap = is_stateful_model ? 0 : 1;
+        
+        if (pos_min > pos_min_thold + threshold_gap) {
+            
+            LLAMA_LOG_WARN("CHECKPOINT: Cache state MISMATCH detected: slot=%d, is_hybrid=%d, pos_min=%d, pos_max=%d, n_past=%d, cache_size=%d, threshold=%d. Restoring...\n",
+                slot.id, is_stateful_model, pos_min, pos_max, slot.n_past, 
+                (int)slot.cache_tokens.size(), pos_min_thold + threshold_gap);
 
-            SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", slot.n_past, (int)slot.cache_tokens.size(), slot.id, pos_min);
-
-            // search for a context checkpoint
             const auto it = std::find_if(
                 slot.server_cached_prompt.checkpoints.rbegin(),
                 slot.server_cached_prompt.checkpoints.rend(),
                 [&](const auto & cur) {
-                    // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                    return cur.pos_min < pos_min_thold;
+                    return cur.pos_min <= pos_min_thold && cur.pos_max >= pos_min_thold;
                 }
             );
 
-            bool do_reset = it == slot.server_cached_prompt.checkpoints.rend();
+            bool do_reset = (it == slot.server_cached_prompt.checkpoints.rend());
 
             if (!do_reset) {
-                // restore the context checkpoint
                 const size_t checkpoint_size = it->data.size();
-                const size_t n = llama_state_seq_set_data(ctx, it->data.data(), checkpoint_size, slot.id);
+                
+                const size_t n = llama_state_seq_set_data(
+                    ctx, 
+                    it->data.data(), 
+                    checkpoint_size, 
+                    slot.id
+                );
 
                 if (n != checkpoint_size) {
-                    SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, (float)checkpoint_size / 1024 / 1024);
+                    LLAMA_LOG_ERROR("CHECKPOINT: Failed to restore checkpoint: slot=%d, pos_min=%d, pos_max=%d, size=%.3f MiB, restored=%zu/%zu. Falling back to full rebuild.\n",
+                        slot.id, it->pos_min, it->pos_max, 
+                        (float)checkpoint_size / 1024 / 1024, n, checkpoint_size);
                     do_reset = true;
-                    //printf("[DEBUG] `do_reset` was set to `true` after failing to restore a checkpoint");
                 } else {
-                    slot.n_past = std::min(slot.n_past, std::max(it->pos_min + 1, it->pos_max));
-                    SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, (float)checkpoint_size / 1024 / 1024);
+                    slot.n_past = it->pos_max;
+                    slot.n_past_prompt = it->pos_max;
+                    slot.cache_tokens.keep_first(it->pos_max);
+                    
+                    LLAMA_LOG_INFO("CHECKPOINT: Successfully restored from checkpoint: slot=%d, pos_min=%d, pos_max=%d, n_past=%d, cache_size=%d\n",
+                        slot.id, it->pos_min, it->pos_max, slot.n_past, (int)slot.cache_tokens.size());
                 }
             }
 
             if (do_reset) {
-                SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                    "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                LLAMA_LOG_WARN("CHECKPOINT: NO VALID CHECKPOINT FOUND - FORCING FULL REBUILD: slot=%d, reason=rollback beyond checkpoints, prompt_tokens=%d. Entire prompt will be reprocessed.\n",
+                    slot.id, (int)slot.cache_tokens.size());
+                
                 slot.n_past = 0;
                 slot.n_past_prompt = 0;
+                slot.n_past_se = 0;
+                slot.cache_tokens.clear();
+                
+                llama_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+                common_sampler_reset(slot.ctx_sampling);
+                
+                LLAMA_LOG_INFO("CHECKPOINT: Cache cleared. Full reprocessing required: slot=%d\n", slot.id);
             }
         }
     }
 
-    {
-        // erase any checkpoints with pos_min > pos_min_thold
-        for (auto it = slot.server_cached_prompt.checkpoints.begin(); it != slot.server_cached_prompt.checkpoints.end();) {
+    if (slot.n_past == 0) {
+        size_t erased_count = slot.server_cached_prompt.checkpoints.size();
+        slot.server_cached_prompt.checkpoints.clear();
+        
+        LLAMA_LOG_DEBUG("CHECKPOINT: Erased all %zu checkpoints after full rebuild: slot=%d\n", erased_count, slot.id);
+    } else {
+        for (auto it = slot.server_cached_prompt.checkpoints.begin(); 
+             it != slot.server_cached_prompt.checkpoints.end(); ) {
             const auto & cur = *it;
+            
             if (cur.pos_min > pos_min_thold) {
-                SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, (float)cur.data.size() / 1024 / 1024);
+                LLAMA_LOG_DEBUG("CHECKPOINT: Erased invalidated checkpoint: slot=%d, pos_min=%d, pos_max=%d, size=%.2f MiB, current_n_past=%d\n",
+                    slot.id, cur.pos_min, cur.pos_max, 
+                    (float)cur.data.size() / 1024 / 1024, slot.n_past);
                 it = slot.server_cached_prompt.checkpoints.erase(it);
             } else {
                 ++it;
@@ -2651,67 +2743,151 @@ void server_context::apply_checkpoint(server_slot & slot) {
     }
 }
 
+// ============================================================================
+// FUNCTION: create_checkpoint
+// ============================================================================
+// PURPOSE:
+//   Save a snapshot of the current KV cache state for later restoration.
+//
+// WHY THIS EXISTS (Qwen 3.5 Hybrid Architecture):
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │ During generation, tokens are added to the KV cache one by one.        │
+// │ For hybrid models, once a token is in the cache, it CANNOT be removed  │
+// │ without invalidating the entire cache state.                           │
+// │                                                                         │
+// │ Checkpoints save "restore points" during generation:                   │
+// │                                                                         │
+// │ Generation Progress:                                                    │
+// │ [SYS][USR1][AI1][USR2][AI2]                                            │
+// │    ↑      ↑      ↑      ↑      ↑                                       │
+// │    │      │      │      │      └─ Checkpoint saved here (pos=500)      │
+// │    │      │      │      └─ Checkpoint saved here (pos=450)             │
+// │    │      │      └─ Checkpoint saved here (pos=400)                    │
+// │    │      └─ Checkpoint saved here (pos=200)                           │
+// │    └─ Checkpoint saved here (pos=50)                                   │
+// │                                                                         │
+// │ If user rolls back AI2 → restore from checkpoint at pos=450            │
+// │ If user rolls back AI1 → restore from checkpoint at pos=200            │
+// │ If user rolls back to SYS → NO checkpoint → FULL REBUILD               │
+// └─────────────────────────────────────────────────────────────────────────┘
+//
+// MEMORY COST:
+//   Each checkpoint = ~50-100 MiB (depends on model size and context length)
+//   Default: 8 checkpoints per slot = ~400-800 MiB total
+//
+// CALLED FROM:
+//   send_final_response() — after generation completes
+//   send_token_results() — when generation stops early
+//   speculative_decoding_accept() — during speculative decoding
+// ============================================================================
+
 void server_context::create_checkpoint(server_slot & slot) {
-    //bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+    bool do_checkpoint = (params_base.n_ctx_checkpoints > 0);
+    
+    do_checkpoint = do_checkpoint && 
+                    slot.task && 
+                    slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+    
+    bool is_stateful_model = llama_model_is_hybrid(model) || 
+                              llama_model_is_recurrent(model);
+    
+    if (is_stateful_model && params_base.n_ctx_checkpoints <= 0) {
+        LLAMA_LOG_WARN("HYBRID MODEL DETECTED but checkpoints disabled: slot=%d. Recommendation: Restart server with --checkpoints 8.\n",
+            slot.id);
+    }
+    
+    int32_t pos_min = 0;
+    int32_t pos_max = 0;
+    
+    if (is_stateful_model) {
+        pos_min = 0;
+        pos_max = llama_kv_cache_seq_pos_max(ctx, slot.id);
+    } else {
+        pos_max = (int32_t)slot.cache_tokens.size();
+    }
+    
+    do_checkpoint = do_checkpoint && (pos_max >= 5);
+    
+    if (!slot.server_cached_prompt.checkpoints.empty()) {
+        int32_t last_pos_max = slot.server_cached_prompt.checkpoints.back().pos_max;
+        do_checkpoint = do_checkpoint && (pos_max > last_pos_max + 64);
+        
+        if (!do_checkpoint) {
+            LLAMA_LOG_DEBUG("CHECKPOINT: Skipped (too close to last checkpoint): slot=%d, pos_max=%d, last_pos_max=%d, min_gap=64\n",
+                slot.id, pos_max, last_pos_max);
+        }
+    }
 
-    //// make checkpoints only for completion tasks
-    //do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+    if (do_checkpoint) {
+        while (slot.server_cached_prompt.checkpoints.size() >= 
+               (size_t)params_base.n_ctx_checkpoints) {
+            
+            const auto & cur = slot.server_cached_prompt.checkpoints.front();
+            LLAMA_LOG_DEBUG("CHECKPOINT: Erasing oldest checkpoint (limit reached): slot=%d, limit=%d, pos_min=%d, pos_max=%d, size=%.2f MiB\n",
+                slot.id, params_base.n_ctx_checkpoints, 
+                cur.pos_min, cur.pos_max, 
+                (float)cur.data.size() / 1024 / 1024);
+            
+            slot.server_cached_prompt.checkpoints.erase(
+                slot.server_cached_prompt.checkpoints.begin());
+        }
 
-    //// make a checkpoint of the parts of the memory that cannot be rolled back.
-    //// checkpoints are created only if:
-    //// - the model architecture is marked as recurrent or hybrid
-    ////
-    //// TODO: try to make this conditional on the context or the memory module, instead of the model type
-    //do_checkpoint = do_checkpoint && (
-    //    llama_model_is_recurrent(model) ||
-    //    llama_model_is_hybrid(model)
-    //    );
-    //int32_t pos_min = 0;
-    //if (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) {
-    //    pos_min =  llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
-    //}
-    //const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
+        const size_t checkpoint_size = llama_state_seq_get_size(ctx, slot.id);
+        
+        if (checkpoint_size > 0) {
+            auto & cur = slot.server_cached_prompt.checkpoints.emplace_back(
+                server_prompt_checkpoint{
+                    pos_min,
+                    pos_max,
+                    std::vector<uint8_t>(checkpoint_size),
+                });
 
-    //// no need for empty or small checkpoints
-    //do_checkpoint = do_checkpoint && (pos_min >= 0 && pos_max >= 5);
+            llama_state_seq_get_data(ctx, cur.data.data(), checkpoint_size, slot.id);
 
-    //// no need to create checkpoints that are too close together
-    //do_checkpoint = do_checkpoint && (slot.server_cached_prompt.checkpoints.empty() || pos_max > slot.server_cached_prompt.checkpoints.back().pos_max + 64);
-
-    //if (do_checkpoint) {
-    //    while (slot.server_cached_prompt.checkpoints.size() >= (size_t)params_base.n_ctx_checkpoints) {
-    //        // make room for the new checkpoint, if needed
-    //        const auto & cur = slot.server_cached_prompt.checkpoints.front();
-
-    //        SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n",
-    //            cur.pos_min, cur.pos_max, (float)cur.data.size() / 1024 / 1024);
-
-    //        slot.server_cached_prompt.checkpoints.erase(slot.server_cached_prompt.checkpoints.begin());
-    //    }
-
-    //    const size_t checkpoint_size = llama_state_seq_get_size(ctx, slot.id);
-
-    //    auto & cur = slot.server_cached_prompt.checkpoints.emplace_back(server_prompt_checkpoint{
-    //        /*.pos_min = */ pos_min,
-    //        /*.pos_max = */ pos_max,
-    //        /*.data    = */ std::vector<uint8_t>(checkpoint_size),
-    //        });
-
-    //    llama_state_seq_get_data(ctx, cur.data.data(), checkpoint_size, slot.id);
-
-    //    SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, size = %.3f MiB)\n",
-    //        (int)slot.server_cached_prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min, cur.pos_max, (float)cur.data.size() / 1024 / 1024);
-    //}
+            LLAMA_LOG_INFO("CHECKPOINT: Created checkpoint: slot=%d, index=%d/%d, hybrid=%d, pos_min=%d, pos_max=%d, size=%.2f MiB\n",
+                slot.id, (int)slot.server_cached_prompt.checkpoints.size(), 
+                params_base.n_ctx_checkpoints, is_stateful_model,
+                cur.pos_min, cur.pos_max, 
+                (float)cur.data.size() / 1024 / 1024);
+        }
+    }
 }
 
-void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type) {
+void server_context::extend_context(const int32_t n_tokens) {
+    for (auto& slot : slots) {
+        if (slot.ga_n != 1) {
+            // context extension via Self-Extend
+            while (slot.n_past_se >= slot.ga_i + slot.ga_w) {
+                const int ib = (slot.ga_n * slot.ga_i) / slot.ga_w;
+                const int bd = (slot.ga_w / slot.ga_n) * (slot.ga_n - 1);
+                const int dd = (slot.ga_w / slot.ga_n) - ib * bd - slot.ga_w;
+
+                LLAMA_LOG_DEBUG("\n");
+                LLAMA_LOG_DEBUG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", slot.ga_i, slot.n_past_se, ib * bd, slot.ga_i + ib * bd, slot.n_past_se + ib * bd);
+                LLAMA_LOG_DEBUG("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n, (slot.ga_i + ib * bd) / slot.ga_n, (slot.ga_i + ib * bd + slot.ga_w) / slot.ga_n);
+                LLAMA_LOG_DEBUG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd, slot.ga_i + ib * bd + slot.ga_w + dd, slot.n_past_se + ib * bd + dd);
+
+                llama_kv_cache_seq_add(ctx, slot.id, slot.ga_i, slot.n_past_se, ib * bd);
+                llama_kv_cache_seq_div(ctx, slot.id, slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
+                llama_kv_cache_seq_add(ctx, slot.id, slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
+
+                slot.n_past_se -= bd;
+                slot.ga_i += slot.ga_w / slot.ga_n;
+
+                LLAMA_LOG_DEBUG("\nn_past_old = %d, n_past = %d, ga_i = %d\n\n", slot.n_past_se + bd, slot.n_past_se, slot.ga_i);
+            }
+            slot.n_past_se += n_tokens;
+        }
+    }
+}
+
+
+void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch, int32_t & batch_type) {
     if (params_base.cont_batching || batch.n_tokens == 0) {
         for (auto& slot : slots) {
-            // this slot still has a prompt to be processed
             if (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT) {
                 auto& prompt_tokens = slot.prompt_tokens;
 
-                // we haven't tokenized the prompt yet - do it now:
                 if (prompt_tokens.empty() || slot.n_prompt_tokens == 0) {
                     LOG_VERBOSE("tokenizing prompt", {
                         {"id_slot", slot.id},
@@ -2728,36 +2904,27 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             params_base.input_suffix.erase(0, 1);
                             suff_rm_leading_spc = false;
                         }
-
                         auto prefix_tokens = tokenize(slot.params.input_prefix, false);
                         auto suffix_tokens = tokenize(slot.params.input_suffix, false);
-
-                        const int space_token = 29871; // TODO: this should not be hardcoded
+                        const int space_token = 29871; 
                         if (suff_rm_leading_spc && !suffix_tokens.empty() && suffix_tokens[0] == space_token) {
                             suffix_tokens.erase(suffix_tokens.begin());
                         }
-
                         prefix_tokens.insert(prefix_tokens.begin(), llama_token_prefix(model));
                         suffix_tokens.insert(suffix_tokens.begin(), llama_token_suffix(model));
-
                         auto embd_inp = params_base.spm_infill ? suffix_tokens : prefix_tokens;
                         auto embd_end = params_base.spm_infill ? prefix_tokens : suffix_tokens;
                         if (add_bos) {
                             embd_inp.insert(embd_inp.begin(), llama_token_bos(model));
                         }
                         embd_inp.insert(embd_inp.end(), embd_end.begin(), embd_end.end());
-
                         const llama_token middle_token = llama_token_middle(model);
                         if (middle_token >= 0) {
                             embd_inp.push_back(middle_token);
                         }
-
                         prompt_tokens = server_tokens(embd_inp, false);
                     }
-                    else {
-                        // prompt_tokens = tokenize(slot.prompt, system_prompt.empty()); // add BOS if there isn't system prompt
-                    }
-
+                    
                     slot.n_past = 0;
                     slot.n_prompt_tokens = prompt_tokens.size();
 
@@ -2767,16 +2934,11 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         {"n_ctx",           slot.n_ctx},
                         {"n_keep",          slot.params.n_keep},
                         {"n_prompt_tokens", slot.n_prompt_tokens},
-                        {"prompt_tokens", prompt_tokens.detokenize(ctx, true)},
+                        {"prompt_tokens",   prompt_tokens.detokenize(ctx, true)},
                         });
 
-                    // empty prompt passed -> release the slot and send empty response
                     if (prompt_tokens.empty()) {
-                        LOG_INFO("empty prompt - releasing slot", {
-                            {"id_slot", slot.id},
-                            {"id_task", slot.id_task}
-                            });
-
+                        LLAMA_LOG_INFO("empty prompt - releasing slot: slot=%d, task=%d\n", slot.id, slot.id_task);
                         slot.state = SLOT_STATE_PROCESSING;
                         slot.command = SLOT_COMMAND_NONE;
                         send_final_response(slot);
@@ -2786,7 +2948,6 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     }
 
                     if (slot.embedding) {
-                        // this prompt is too large to process - discard it
                         if (slot.n_prompt_tokens > n_ubatch) {
                             slot.state = SLOT_STATE_PROCESSING;
                             slot.command = SLOT_COMMAND_NONE;
@@ -2796,8 +2957,6 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         }
                     }
                     else {
-                        // if input prompt is too big, truncate it (if group attention self-extend is disabled)
-                        // context shift for prompt processing
                         if (slot.ga_n == 1 && slot.n_prompt_tokens >= slot.n_ctx) {
                             if (!params_base.ctx_shift) {
                                 send_error(slot, "the request exceeds the available context size, try increasing it", ERROR_TYPE_SERVER);
@@ -2805,11 +2964,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                                 continue;
                             }
                             if (mctx) {
-                                // we should never reach this because params.ctx_shift is automatically disabled if mmproj is loaded
-                                // we don't support ctx_shift because an image chunk may contains multiple tokens
                                 GGML_ABORT("not supported by multimodal");
                             }
-
                             context_shift_prompt(ctx, slot);
                             slot.truncated = true;
                             LOG_VERBOSE("input truncated", {
@@ -2821,19 +2977,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                                 {"n_prompt_tokens", slot.n_prompt_tokens},
                                 {"prompt_tokens",   prompt_tokens.detokenize(ctx, true)},
                                 });
-
                             GGML_ASSERT(slot.n_prompt_tokens < slot.n_ctx);
-
-#ifndef NDEBUG
-                            // debug
-                            common_prefix prefix = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens, false);
-                            int32_t back = 1;
-                            if (slot.cache_tokens.size() && slot.cache_tokens.size() > prefix.first + 20
-                                && prefix.second >= back && prefix.first >= back) {
-                                LLAMA_LOG_INFO("After context shift :\n");
-                                print_tokens(slot.prompt_tokens, slot.cache_tokens, prefix.second - back, prefix.first - back, 50);
-                            }
-#endif
                         }
                         else {
                             slot.n_discarded_prompt = 0;
@@ -2846,32 +2990,51 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         }
                         else {
                             GGML_ASSERT(slot.ga_n == 1);
-
-                            // reuse any previously computed tokens that are common with the new prompt
-                            common_prefix prefix = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens, true); // string level match
-                            common_prefix prefix_nonexact = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens, false);
-                            auto n_past0 = slot.cache_tokens.get_common_prefix_exact(prompt_tokens); // token level match
-                            LLAMA_LOG_INFO("======== Cache: cache_size = %d, n_past0 =  %d, n_past1 =  %d, n_past_prompt1 = %d,  n_past2 =  %d, n_past_prompt2 =  %d\n", (int32_t)slot.cache_tokens.size(), (int32_t)n_past0, (int32_t)prefix.first, (int32_t)prefix.second, (int32_t)prefix_nonexact.first, (int32_t)prefix_nonexact.second);
-                            int32_t size_threshold = 20;
-                            if (prefix.first + size_threshold < prefix_nonexact.first) {
-                                LLAMA_LOG_WARN("Common part contains missing or extra space and new line\n");
-                                prefix = prefix_nonexact;
-                            }
-                            slot.n_past = prefix.first;
-                            slot.n_past_prompt = prefix.second;
-                            if (slot.n_past != slot.n_past_prompt) {
-                                LLAMA_LOG_INFO("Mistokenization found and handled successfully.\n");
-                            }
-                            if ((slot.n_past + size_threshold < slot.cache_tokens.size()))
-                            {
-                                LLAMA_LOG_WARN("Common part does not match fully\n");
-                                int32_t back = 4;
-                                if (prefix.second >= back && prefix.first >= back) {
-                                    print_tokens(slot.prompt_tokens, slot.cache_tokens, prefix.second - back, prefix.first - back, 30);
+                            
+                            common_prefix prefix = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens, true);
+                            
+                            bool is_stateful_model = llama_model_is_hybrid(llama_get_model(slot.ctx)) || 
+                                                      llama_model_is_recurrent(llama_get_model(slot.ctx));
+                            
+                            if (is_stateful_model) {
+                                slot.n_past = prefix.first;
+                                slot.n_past_prompt = prefix.second;
+                                
+                                if (prefix.first < prefix.second) {
+                                    LLAMA_LOG_WARN("HYBRID MODEL: Token-level mismatch detected: slot=%d, exact_match=%d, text_match=%d. Using EXACT match.\n",
+                                        slot.id, (int)prefix.first, (int)prefix.second);
                                 }
+                                
+                                LLAMA_LOG_INFO("CACHE (hybrid): slot=%d, exact_prefix=%d, cache_size=%d, prompt_size=%d\n",
+                                    slot.id, (int)prefix.first, (int)slot.cache_tokens.size(), (int)prompt_tokens.size());
+                                
+                            } else {
+                                common_prefix prefix_nonexact = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens, false);
+                                int32_t size_threshold = 5;
+                                
+                                if (prefix_nonexact.first > prefix.first && 
+                                    prefix_nonexact.first - prefix.first <= size_threshold) {
+                                    LLAMA_LOG_DEBUG("CACHE (transformer): Using fuzzy match (diff=%d tokens <= threshold=%d)\n",
+                                        prefix_nonexact.first - prefix.first, size_threshold);
+                                    prefix = prefix_nonexact;
+                                }
+                                
+                                slot.n_past = prefix.first;
+                                slot.n_past_prompt = prefix.second;
+                            }
+                            
+                            if (slot.n_past > (int32_t)slot.cache_tokens.size()) {
+                                LLAMA_LOG_ERROR("CACHE ERROR: n_past (%d) exceeds cache size (%d) — TRUNCATING\n",
+                                    slot.n_past, (int)slot.cache_tokens.size());
+                                slot.n_past = slot.cache_tokens.size();
+                                slot.n_past_prompt = slot.n_past;
+                            }
+                            
+                            if (is_stateful_model && slot.n_past < (int32_t)slot.cache_tokens.size()) {
+                                LLAMA_LOG_DEBUG("HYBRID MODEL: Cache has extra tokens that cannot be evicted: n_past=%d, cache_size=%d\n",
+                                    slot.n_past, (int)slot.cache_tokens.size());
                             }
 
-                            // push the prompt into the sampling context (do not apply grammar)
                             for (int i = 0; i < slot.n_past; ++i) {
                                 common_sampler_accept(slot.ctx_sampling, ctx, slot.cache_tokens[i], false);
                             }
@@ -2879,30 +3042,22 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     }
                     apply_checkpoint(slot);
                     if (slot.n_past_prompt == slot.n_prompt_tokens && slot.n_past_prompt > 0) {
-                        // we have to evaluate at least 1 token to generate logits.
-                        LOG_INFO("we have to evaluate at least 1 token to generate logits", {
-                            { "id_slot", slot.id },
-                            { "id_task", slot.id_task }
-                            });
-
+                        LLAMA_LOG_INFO("we have to evaluate at least 1 token to generate logits: slot=%d, task=%d\n", slot.id, slot.id_task);
                         slot.n_past_prompt--;
                         slot.n_past--;
                         if (slot.ga_i > 0) {
                             slot.n_past_se--;
                         }
                     }
-
                     slot.n_prompt_tokens_processed = 0;
                 }
 
                 if (slot.embedding) {
-                    // cannot fit the prompt in the current batch - will try next iter
                     if (batch.n_tokens + slot.n_prompt_tokens > n_batch) {
                         continue;
                     }
                 }
 
-                // check that we are in the right batch_type, if not defer the slot
                 bool slot_type = slot.embedding ? 1 : 0;
                 if (batch_type == -1) {
                     batch_type = slot_type;
@@ -2911,45 +3066,30 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     continue;
                 }
 
-                // keep only the common part
-                // remove the non-common part from the cache
-                if (slot.n_past < 0)
-                {
+                if (slot.n_past < 0) {
                     slot.n_past = 0;
                 }
                 slot.cache_tokens.keep_first(slot.n_past);
                 int p0 = (int)system_tokens.size() + slot.n_past;
                 p0 = system_tokens.size() + slot.cache_tokens.pos_next();
                 if (!llama_kv_cache_seq_rm(ctx, slot.id, p0, -1)) {
-                    // could not partially delete (likely using a non-Transformer model)
                     llama_kv_cache_seq_rm(ctx, slot.id, -1, -1);
-
                     p0 = (int)system_tokens.size();
                     if (p0 != 0) {
-                        // copy over the system prompt when there is one
                         llama_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
                     }
-
-                    // there is no common part left (except for the system prompt)
                     slot.n_past = 0;
                     slot.n_past_se = 0;
                     slot.ga_i = 0;
-                    // TODO: is the system prompt ever in the sampling context?
                     common_sampler_reset(slot.ctx_sampling);
                 }
 
-                LOG_INFO("kv cache rm [p0, end)", {
-                    { "id_slot", slot.id },
-                    { "id_task", slot.id_task },
-                    { "p0",      p0 }
-                    });
+                LLAMA_LOG_INFO("kv cache rm [p0, end): slot=%d, task=%d, p0=%d\n", slot.id, slot.id_task, p0);
 
-                // check if we should process the image
                 if (slot.n_past_prompt < slot.n_prompt_tokens
                     && slot.prompt_tokens[slot.n_past_prompt] == LLAMA_TOKEN_NULL) {
-                    // process the image
                     size_t n_tokens_out = 0;
-                    llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past; // add offset to prompt
+                    llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past;
                     int32_t res = slot.prompt_tokens.process_chunk(ctx, mctx, slot.n_past_prompt, p1, slot.id, n_tokens_out);
                     if (res != 0) {
                         LLAMA_LOG_ERROR("failed to process image, res = %d\n", res);
@@ -2957,34 +3097,24 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                         continue;
                     }
-
-                    // add the image chunk to cache
                     {
                         const auto& chunk = slot.prompt_tokens.find_chunk(slot.n_past_prompt);
-                        slot.cache_tokens.push_back(chunk.get()); // copy
+                        slot.cache_tokens.push_back(chunk.get());
                     }
-
                     slot.n_past += n_tokens_out;
                     slot.n_past_prompt += n_tokens_out;
                     slot.n_prompt_tokens_processed += n_tokens_out;
-
                 }
 
-
-
                 int32_t slot_npast = slot.n_past_se > 0 ? slot.n_past_se : slot.n_past;
-
                 int32_t ga_i = slot.ga_i;
                 int32_t ga_n = slot.ga_n;
                 int32_t ga_w = slot.ga_w;
 
-                // add prompt tokens for processing in the current batch
-                // TODO: the self-extend stuff here is a mess - simplify and/or abstract it somehow
                 while (slot.n_past_prompt < slot.n_prompt_tokens && batch.n_tokens < n_batch) {
-                    // get next token to process
                     llama_token cur_tok = slot.prompt_tokens[slot.n_past_prompt];
                     if (cur_tok == LLAMA_TOKEN_NULL) {
-                        break; // end of text chunk
+                        break;
                     }
                     if (slot.ga_n != 1) {
                         while (slot_npast >= ga_i + ga_w) {
@@ -2996,15 +3126,14 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                     int p0 = system_tokens.size() + slot.cache_tokens.pos_next();
                     common_batch_add(batch, cur_tok, p0, { slot.id }, slot.embedding);
-
                     slot.cache_tokens.push_back(cur_tok);
-
 
                     slot.n_prompt_tokens_processed++;
                     slot_npast++;
                     slot.n_past_prompt++;
                     slot.n_past++;
                 }
+                
                 LOG_VERBOSE("prompt processing progress", {
                     {"id_slot",  slot.id},
                     {"n_past",   slot.n_past},
@@ -3013,7 +3142,6 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     {"progress", (float)slot.n_prompt_tokens_processed / slot.n_prompt_tokens},
                     });
 
-                // entire prompt has been processed - start decoding new tokens
                 if (slot.n_past_prompt == slot.n_prompt_tokens) {
                     slot.state = SLOT_STATE_PROCESSING;
                     slot.command = SLOT_COMMAND_NONE;
@@ -3026,14 +3154,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             common_sampler_accept(slot.ctx_sampling, ctx, id, false);
                         }
                     }
-
-                    // extract the logits only for the last token
                     batch.logits[batch.n_tokens - 1] = true;
-
                     slot.n_decoded = 0;
                     slot.i_batch = batch.n_tokens - 1;
-
-                    //create_checkpoint(slot);
 
                     LOG_VERBOSE("prompt done", {
                         {"id_slot",  slot.id},
@@ -3051,36 +3174,6 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
     }
 }
 
-void server_context::extend_context(const int32_t n_tokens) {
-    for (auto& slot : slots) {
-        if (slot.ga_n != 1) {
-            // context extension via Self-Extend
-            // TODO: simplify and/or abstract this
-            while (slot.n_past_se >= slot.ga_i + slot.ga_w) {
-                const int ib = (slot.ga_n * slot.ga_i) / slot.ga_w;
-                const int bd = (slot.ga_w / slot.ga_n) * (slot.ga_n - 1);
-                const int dd = (slot.ga_w / slot.ga_n) - ib * bd - slot.ga_w;
-
-                LOG_TEE("\n");
-                LOG_TEE("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", slot.ga_i, slot.n_past_se, ib * bd, slot.ga_i + ib * bd, slot.n_past_se + ib * bd);
-                LOG_TEE("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n, (slot.ga_i + ib * bd) / slot.ga_n, (slot.ga_i + ib * bd + slot.ga_w) / slot.ga_n);
-                LOG_TEE("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd, slot.ga_i + ib * bd + slot.ga_w + dd, slot.n_past_se + ib * bd + dd);
-
-                llama_kv_cache_seq_add(ctx, slot.id, slot.ga_i, slot.n_past_se, ib * bd);
-                llama_kv_cache_seq_div(ctx, slot.id, slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
-                llama_kv_cache_seq_add(ctx, slot.id, slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
-
-                slot.n_past_se -= bd;
-
-                slot.ga_i += slot.ga_w / slot.ga_n;
-
-                LOG_TEE("\nn_past_old = %d, n_past = %d, ga_i = %d\n\n", slot.n_past_se + bd, slot.n_past_se, slot.ga_i);
-            }
-
-            slot.n_past_se += n_tokens;
-        }
-    }
-}
 
 void server_context::speculative_decoding_accept() {
     for (auto& slot : slots) {
@@ -3130,8 +3223,8 @@ void server_context::speculative_decoding_accept() {
             if (slot.n_buffer == 0 || llama_model_is_hybrid(llama_get_model(slot.ctx)) || llama_model_is_recurrent(llama_get_model(slot.ctx))) {
                 if (!process_token(result, slot)) {
                     // release slot because of stop condition
+                    create_checkpoint(slot);
                     send_final_response(slot);
-                    //create_checkpoint(slot);
                     slot.release();
                     slot.print_timings();
                     metrics.on_prediction(slot);
@@ -3165,8 +3258,8 @@ void server_context::send_token_results(completion_token_outputs& results, serve
         bool has_next = process_token(it, slot);
         count++;
         if (!has_next) {
+            create_checkpoint(slot);
             send_final_response(slot);
-            //create_checkpoint(slot);
             slot.release();
             slot.print_timings();
             metrics.on_prediction(slot);

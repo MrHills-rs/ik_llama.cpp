@@ -2043,6 +2043,19 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cache_ram_n_min = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--checkpoints") {
+        CHECK_ARG
+        params.n_ctx_checkpoints = std::stoi(argv[i]);
+        
+        // Warn user if they're disabling checkpoints for a hybrid model
+        if (params.n_ctx_checkpoints <= 0) {
+            fprintf(stderr, 
+                "⚠️  WARNING: Checkpoints disabled (--checkpoints 0).\n"
+                "   For hybrid models (Qwen 3.5, Mamba, RWKV), this means EVERY rollback\n"
+                "   will require FULL prompt reprocessing. Recommended: --checkpoints 8\n");
+        }
+        return true;
+    }
     if (arg == "--pos") {
         CHECK_ARG
         params.i_pos = std::stoi(argv[i]);
@@ -2225,6 +2238,14 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-cram, --cache-ram N",           "set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)",params.cache_ram_mib });
     options.push_back({ "*",           "-crs,  --cache-ram-similarity N",           "max of similarity of prompt tokens to cache tokens that triggers prompt cache (default: %.2f).",params.cache_ram_similarity });
     options.push_back({ "*",           "-cram-n-min --cache-ram-n-min N",           "minimum number of the cached tokens that triggers prompt cache (default: %d).", params.cache_ram_n_min });
+        options.push_back({ "server",      "       --checkpoints N",          
+        "number of context checkpoints to keep per slot (default: %d, 0 = disabled).\n"
+        "   CRITICAL for hybrid models (Qwen 3.5, Mamba, RWKV):\n"
+        "   - Checkpoints save KV cache state snapshots during generation\n"
+        "   - Enables fast rollback without full reprocessing\n"
+        "   - Recommended: 8 checkpoints per slot\n"
+        "   - Memory cost: ~50-100 MiB per checkpoint", 
+        params.n_ctx_checkpoints });
     options.push_back({ "*",           "-n,    --predict N",            "number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)", params.n_predict });
     options.push_back({ "*",           "-b,    --batch-size N",         "logical maximum batch size (default: %d)", params.n_batch });
     options.push_back({ "*",           "-ub,   --ubatch-size N",        "physical maximum batch size (default: %d)", params.n_ubatch });
