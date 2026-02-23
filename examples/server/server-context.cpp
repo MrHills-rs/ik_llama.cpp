@@ -3166,25 +3166,23 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     continue;
                 }
 
+
+
+
+
+
                 if (slot.n_past < 0) {
                     slot.n_past = 0;
                 }
                 slot.cache_tokens.keep_first(slot.n_past);
-                int p0 = (int)system_tokens.size() + slot.n_past;
-                p0 = system_tokens.size() + slot.cache_tokens.pos_next();
-                if (!llama_kv_cache_seq_rm(ctx, slot.id, p0, -1)) {
-                    llama_kv_cache_seq_rm(ctx, slot.id, -1, -1);
-                    p0 = (int)system_tokens.size();
-                    if (p0 != 0) {
-                        llama_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
-                    }
-                    slot.n_past = 0;
-                    slot.n_past_se = 0;
-                    slot.ga_i = 0;
-                    common_sampler_reset(slot.ctx_sampling);
-                }
+                
+                // KV cache already cleared in tokenization block above - skip here
+                LLAMA_LOG_DEBUG("KV cache: continuing batch chunk: slot=%d, n_past=%d, n_past_prompt=%d\n",
+                    slot.id, slot.n_past, slot.n_past_prompt);
 
-                LLAMA_LOG_INFO("kv cache rm [p0, end): slot=%d, task=%d, p0=%d\n", slot.id, slot.id_task, p0);
+
+
+
 
                 if (slot.n_past_prompt < slot.n_prompt_tokens
                     && slot.prompt_tokens[slot.n_past_prompt] == LLAMA_TOKEN_NULL) {
