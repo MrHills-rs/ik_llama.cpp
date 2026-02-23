@@ -1730,8 +1730,6 @@ void server_context::send_partial_response(server_slot& slot, completion_token_o
 
 void server_context::send_final_response(server_slot& slot) {
     
-    create_checkpoint(slot);
-    
     auto res = std::make_unique<server_task_result_cmpl_final>();
     res->final_result = true;
     res->id = slot.id_task;
@@ -2678,104 +2676,166 @@ void server_context::add_sampled_tokens() {
 // ============================================================================
 
 void server_context::apply_checkpoint(server_slot & slot) {
-    const auto pos_min_thold = std::max(0, slot.n_past - 1);
+    // ========================================================================
+    // STEP 1: Determine if checkpoint restore is needed
+    // ========================================================================
+    // A mismatch occurs when cache_tokens has more tokens than n_past
+    // This happens when frontend sends a shorter/modified prompt than before
     
-    if (!mctx && slot.n_past > 0 && slot.n_past < (int32_t)slot.cache_tokens.size()) {
+    bool is_stateful_model = llama_model_is_hybrid(llama_get_model(slot.ctx)) || 
+                              llama_model_is_recurrent(llama_get_model(slot.ctx));
+    
+    // For stateful models, any mismatch requires checkpoint restore or rebuild
+    // For transformer models, we can often just truncate (but checkpoint is safer)
+    bool needs_restore = false;
+    
+    if (slot.n_past > 0 && slot.n_past < (int32_t)slot.cache_tokens.size()) {
+        needs_restore = true;
+    }
+    
+    // Also check if we have no checkpoints but cache has tokens (fresh mismatch)
+    if (slot.n_past == 0 && !slot.cache_tokens.empty() && 
+        !slot.server_cached_prompt.checkpoints.empty()) {
+        needs_restore = true;
+    }
+    
+    // If no mismatch, nothing to do
+    if (!needs_restore) {
+        return;
+    }
+    
+    // ========================================================================
+    // STEP 2: Query actual KV cache state
+    // ========================================================================
+    // For stateful models, we must verify KV cache matches our expected n_past
+    
+    int32_t kv_pos_max = 0;
+    if (is_stateful_model) {
+        kv_pos_max = llama_kv_cache_seq_pos_max(ctx, slot.id);
         
-        int32_t pos_min = 0;
-        int32_t pos_max = 0;
-        
-        bool is_stateful_model = llama_model_is_hybrid(llama_get_model(slot.ctx)) || 
-                                  llama_model_is_recurrent(llama_get_model(slot.ctx));
-        
-        if (is_stateful_model) {
-            pos_min = 0;
-            pos_max = llama_kv_cache_seq_pos_max(ctx, slot.id);
-            
-            LLAMA_LOG_INFO("CHECKPOINT (hybrid model): slot=%d, pos_min=%d, pos_max=%d, n_past=%d, cache_size=%d\n",
-                slot.id, pos_min, pos_max, slot.n_past, (int)slot.cache_tokens.size());
+        LLAMA_LOG_INFO("CHECKPOINT: Stateful model detected: slot=%d, n_past=%d, cache_size=%d, kv_pos_max=%d, checkpoints=%zu\n",
+            slot.id, slot.n_past, (int)slot.cache_tokens.size(), kv_pos_max, 
+            slot.server_cached_prompt.checkpoints.size());
+    }
+    
+    // ========================================================================
+    // STEP 3: Find the best valid checkpoint to restore from
+    // ========================================================================
+    // Search criteria:
+    // 1. Checkpoint pos_max must be <= n_past (don't restore beyond current prompt)
+    // 2. Prefer checkpoints with highest pos_max (minimize reprocessing)
+    // 3. Checkpoints are searched in reverse (newest first)
+    
+    const auto it = std::find_if(
+        slot.server_cached_prompt.checkpoints.rbegin(),
+        slot.server_cached_prompt.checkpoints.rend(),
+        [&](const auto & cur) {
+            // Checkpoint must not extend beyond our current prompt length
+            return cur.pos_max <= slot.n_past;
         }
-
-        int32_t threshold_gap = is_stateful_model ? 0 : 1;
+    );
+    
+    bool found_checkpoint = (it != slot.server_cached_prompt.checkpoints.rend());
+    
+    // ========================================================================
+    // STEP 4: Restore from checkpoint OR full rebuild
+    // ========================================================================
+    
+    if (found_checkpoint) {
+        // ====================================================================
+        // OPTION A: Restore from valid checkpoint
+        // ====================================================================
         
-        if (pos_min > pos_min_thold + threshold_gap) {
+        const size_t checkpoint_size = it->data.size();
+        const int32_t restore_pos = it->pos_max;
+        
+        const size_t n = llama_state_seq_set_data(
+            ctx, 
+            it->data.data(), 
+            checkpoint_size, 
+            slot.id
+        );
+
+        if (n != checkpoint_size) {
+            // Restore failed - fall back to full rebuild
+            LLAMA_LOG_ERROR("CHECKPOINT: Restore failed: slot=%d, expected=%zu, restored=%zu. Falling back to full rebuild.\n",
+                slot.id, checkpoint_size, n);
+            found_checkpoint = false;
+        } else {
+            // Restore succeeded - update slot state
+            slot.n_past = restore_pos;
+            slot.n_past_prompt = restore_pos;
+            slot.cache_tokens.keep_first(restore_pos);
             
-            LLAMA_LOG_WARN("CHECKPOINT: Cache state MISMATCH detected: slot=%d, is_hybrid=%d, pos_min=%d, pos_max=%d, n_past=%d, cache_size=%d, threshold=%d. Restoring...\n",
-                slot.id, is_stateful_model, pos_min, pos_max, slot.n_past, 
-                (int)slot.cache_tokens.size(), pos_min_thold + threshold_gap);
-
-            const auto it = std::find_if(
-                slot.server_cached_prompt.checkpoints.rbegin(),
-                slot.server_cached_prompt.checkpoints.rend(),
-                [&](const auto & cur) {
-                    return cur.pos_min <= pos_min_thold && cur.pos_max >= pos_min_thold;
-                }
-            );
-
-            bool do_reset = (it == slot.server_cached_prompt.checkpoints.rend());
-
-            if (!do_reset) {
-                const size_t checkpoint_size = it->data.size();
-                
-                const size_t n = llama_state_seq_set_data(
-                    ctx, 
-                    it->data.data(), 
-                    checkpoint_size, 
-                    slot.id
-                );
-
-                if (n != checkpoint_size) {
-                    LLAMA_LOG_ERROR("CHECKPOINT: Failed to restore checkpoint: slot=%d, pos_min=%d, pos_max=%d, size=%.3f MiB, restored=%zu/%zu. Falling back to full rebuild.\n",
-                        slot.id, it->pos_min, it->pos_max, 
-                        (float)checkpoint_size / 1024 / 1024, n, checkpoint_size);
-                    do_reset = true;
-                } else {
-                    slot.n_past = it->pos_max;
-                    slot.n_past_prompt = it->pos_max;
-                    slot.cache_tokens.keep_first(it->pos_max);
-                    
-                    LLAMA_LOG_INFO("CHECKPOINT: Successfully restored from checkpoint: slot=%d, pos_min=%d, pos_max=%d, n_past=%d, cache_size=%d\n",
-                        slot.id, it->pos_min, it->pos_max, slot.n_past, (int)slot.cache_tokens.size());
-                }
-            }
-
-            if (do_reset) {
-                LLAMA_LOG_WARN("CHECKPOINT: NO VALID CHECKPOINT FOUND - FORCING FULL REBUILD: slot=%d, reason=rollback beyond checkpoints, prompt_tokens=%d. Entire prompt will be reprocessed.\n",
-                    slot.id, (int)slot.cache_tokens.size());
-                
-                slot.n_past = 0;
-                slot.n_past_prompt = 0;
-                slot.n_past_se = 0;
-                slot.cache_tokens.clear();
-                
-                llama_kv_cache_seq_rm(ctx, slot.id, -1, -1);
-                common_sampler_reset(slot.ctx_sampling);
-                
-                LLAMA_LOG_INFO("CHECKPOINT: Cache cleared. Full reprocessing required: slot=%d\n", slot.id);
-            }
+            LLAMA_LOG_INFO("CHECKPOINT: Restored successfully: slot=%d, pos=%d-%d, size=%.2f MiB\n",
+                slot.id, it->pos_min, it->pos_max, 
+                (float)checkpoint_size / 1024 / 1024);
         }
     }
 
-    if (slot.n_past == 0) {
+    if (!found_checkpoint) {
+        // ====================================================================
+        // OPTION B: Full rebuild required (no valid checkpoint found)
+        // ====================================================================
+        // This happens when:
+        // - User modified/deleted content before all checkpoints
+        // - Checkpoint restore failed
+        // - No checkpoints exist yet
+        
+        LLAMA_LOG_WARN("CHECKPOINT: Full rebuild required: slot=%d, reason=no_valid_checkpoint, n_past=%d, cache_size=%d, checkpoints=%zu\n",
+            slot.id, slot.n_past, (int)slot.cache_tokens.size(), 
+            slot.server_cached_prompt.checkpoints.size());
+        
+        slot.n_past = 0;
+        slot.n_past_prompt = 0;
+        slot.n_past_se = 0;
+        slot.cache_tokens.clear();
+        
+        llama_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+        
+        if (slot.ctx_sampling != nullptr) {
+            common_sampler_reset(slot.ctx_sampling);
+        }
+        
+        // Clear all checkpoints - none are valid after full rebuild
         size_t erased_count = slot.server_cached_prompt.checkpoints.size();
         slot.server_cached_prompt.checkpoints.clear();
         
-        LLAMA_LOG_DEBUG("CHECKPOINT: Erased all %zu checkpoints after full rebuild: slot=%d\n", erased_count, slot.id);
-    } else {
-        for (auto it = slot.server_cached_prompt.checkpoints.begin(); 
-             it != slot.server_cached_prompt.checkpoints.end(); ) {
-            const auto & cur = *it;
-            
-            if (cur.pos_min > pos_min_thold) {
-                LLAMA_LOG_DEBUG("CHECKPOINT: Erased invalidated checkpoint: slot=%d, pos_min=%d, pos_max=%d, size=%.2f MiB, current_n_past=%d\n",
-                    slot.id, cur.pos_min, cur.pos_max, 
-                    (float)cur.data.size() / 1024 / 1024, slot.n_past);
-                it = slot.server_cached_prompt.checkpoints.erase(it);
-            } else {
-                ++it;
-            }
+        LLAMA_LOG_INFO("CHECKPOINT: Cache cleared for full rebuild: slot=%d, erased_checkpoints=%zu\n", 
+            slot.id, erased_count);
+    }
+    
+    // ========================================================================
+    // STEP 5: Clean up invalidated checkpoints
+    // ========================================================================
+    // After restore (or full rebuild), delete all checkpoints that extend
+    // beyond the current n_past. These represent tokens that no longer exist
+    // in the current prompt context.
+    
+    if (!found_checkpoint) {
+        // Full rebuild already cleared all checkpoints above
+        return;
+    }
+    
+    // Remove checkpoints newer than restore point
+    for (auto it = slot.server_cached_prompt.checkpoints.begin(); 
+         it != slot.server_cached_prompt.checkpoints.end(); ) {
+        
+        const auto & cur = *it;
+        
+        // Delete if checkpoint extends beyond current n_past
+        if (cur.pos_max > slot.n_past) {
+            LLAMA_LOG_DEBUG("CHECKPOINT: Erased invalidated (newer than restore): slot=%d, pos=%d-%d, size=%.2f MiB, current_n_past=%d\n",
+                slot.id, cur.pos_min, cur.pos_max, 
+                (float)cur.data.size() / 1024 / 1024, slot.n_past);
+            it = slot.server_cached_prompt.checkpoints.erase(it);
+        } else {
+            ++it;
         }
     }
+    
+    LLAMA_LOG_DEBUG("CHECKPOINT: Cleanup complete: slot=%d, remaining_checkpoints=%zu, n_past=%d\n",
+        slot.id, slot.server_cached_prompt.checkpoints.size(), slot.n_past);
 }
 
 // ============================================================================
@@ -2851,8 +2911,8 @@ void server_context::create_checkpoint(server_slot & slot) {
     
         
         if (!do_checkpoint) {
-            LLAMA_LOG_DEBUG("CHECKPOINT: Skipped (too close to last checkpoint): slot=%d, pos_max=%d, last_pos_max=%d, min_gap=64\n",
-                slot.id, pos_max, last_pos_max);
+            LLAMA_LOG_DEBUG("CHECKPOINT: Skipped (too close to last checkpoint): slot=%d, pos_max=%d, last_pos_max=%d, min_gap=%d \n",
+                slot.id, pos_max, last_pos_max, gap);
         }
     }
 
@@ -3198,6 +3258,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.n_decoded = 0;
                     slot.i_batch = batch.n_tokens - 1;
 
+                    create_checkpoint(slot);
+                    
                     LOG_VERBOSE("prompt done", {
                         {"id_slot",  slot.id},
                         {"n_past",   slot.n_past},
@@ -3282,7 +3344,6 @@ void server_context::speculative_decoding_accept() {
             if (slot.n_buffer == 0 || llama_model_is_hybrid(llama_get_model(slot.ctx)) || llama_model_is_recurrent(llama_get_model(slot.ctx))) {
                 if (!process_token(result, slot)) {
                     // release slot because of stop condition
-                    create_checkpoint(slot);
                     send_final_response(slot);
                     slot.release();
                     slot.print_timings();
@@ -3317,7 +3378,6 @@ void server_context::send_token_results(completion_token_outputs& results, serve
         bool has_next = process_token(it, slot);
         count++;
         if (!has_next) {
-            create_checkpoint(slot);
             send_final_response(slot);
             slot.release();
             slot.print_timings();
