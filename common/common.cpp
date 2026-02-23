@@ -2057,10 +2057,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         
         // Warn user if they're disabling checkpoints for a hybrid model
         if (params.n_ctx_checkpoints <= 0) {
+            params.n_ctx_checkpoints = 0;
             fprintf(stderr, 
                 "⚠️  WARNING: Checkpoints disabled (--checkpoints 0).\n"
                 "   For hybrid models (Qwen 3.5, Mamba, RWKV), this means EVERY rollback\n"
-                "   will require FULL prompt reprocessing. Recommended: --checkpoints 8\n");
+                "   will require FULL prompt reprocessing. Recommended: --checkpoints 2\n");
         }
         return true;
     }
@@ -2068,8 +2069,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         CHECK_ARG
         params.n_ctx_checkpoints_gap = std::stoi(argv[i]);
         if (params.n_ctx_checkpoints_gap <= 0) {
-            invalid_param = true;
-            return true;
+            params.n_ctx_checkpoints_gap = 1;
         }
         return true;
     }
